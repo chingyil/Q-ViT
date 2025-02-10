@@ -3,25 +3,15 @@ import timm
 import torch
 from functools import partial
 import torch.nn as nn
-from timm.models.registry import register_model
-from quant_vision_transformer import lowbit_VisionTransformer, _cfg
-
-@register_model
-def threebits_deit_small_patch16_224(pretrained=False, **kwargs):
-    model = lowbit_VisionTransformer(
-        nbits=3, patch_size=16, embed_dim=384, depth=12, num_heads=6, mlp_ratio=4, qkv_bias=True,
-        norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
-    model.default_cfg = _cfg()
-    if pretrained:
-        torch.hub.load_state_dict_from_url(
-            url='https://dl.fbaipublicfiles.com/deit/deit_small_distilled_patch16_224-649709d9.pth',
-            map_location="cpu", check_hash=True
-        )
-    return model
+# from timm.models.registry import register_model
+from quant_vision_transformer import lowbit_VisionTransformer #, _cfg
 
 # model = timm.models.create_model("vit_small_patch16_224", pretrained=True)
 # model = timm.models.create_model("fourbits_deit_small_patch16_224", pretrained=True)
-model = timm.models.create_model("threebits_deit_small_patch16_224", pretrained=False)
+# model = timm.models.create_model("threebits_deit_small_patch16_224", pretrained=False)
+model = lowbit_VisionTransformer(
+        nbits=3, patch_size=16, embed_dim=384, depth=12, num_heads=6, mlp_ratio=4, qkv_bias=True,
+        norm_layer=partial(nn.LayerNorm, eps=1e-6))
 model.load_state_dict(torch.load("/Users/chingyilin/Downloads/best_checkpoint_3bit.pth", weights_only=False, map_location=torch.device('cpu'))['model'])
 from timm.models.registry import _model_entrypoints
 # import pdb; pdb.set_trace()
