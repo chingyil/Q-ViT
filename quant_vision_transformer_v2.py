@@ -70,7 +70,7 @@ class ActQ(_ActQ):
 
 class ActQ_v2(_ActQ):
     def __init__(self, in_features, nbits_a=4, mode=Qmodes.kernel_wise, **kwargs):
-        super(ActQ, self).__init__(in_features=in_features, nbits=nbits_a, mode=mode)
+        super(ActQ_v2, self).__init__(in_features=in_features, nbits=nbits_a, mode=mode)
         # print(self.alpha.shape, self.zero_point.shape)
     def forward(self, x0):
         if self.alpha is None:
@@ -158,6 +158,61 @@ class LinearQ(_LinearQ):
         # import pdb; pdb.set_trace()
         return F.linear(x, w_q, self.bias)
 
+class LinearQ_v2(_LinearQ):
+    def __init__(self, in_features, out_features, bias=True, nbits_w=4, step_in1=None, step_in2=None, step_out=None, **kwargs):
+        super(LinearQ_v2, self).__init__(in_features=in_features,
+                                        out_features=out_features, bias=bias, nbits=nbits_w, mode=Qmodes.kernel_wise)
+        self.act = ActQ_v2(in_features=in_features, nbits_a=nbits_w)
+        self.step_in1 = step_in1
+        self.step_in2 = step_in2
+        self.step_out = step_out
+
+    def xquant(self, x):
+        if self.alpha is None:
+            return F.linear(x, self.weight, self.bias)
+        Qn = -2 ** (self.nbits - 1)
+        Qp = 2 ** (self.nbits - 1) - 1
+        if self.training and self.init_state == 0:
+            self.alpha.data.copy_(2 * self.weight.abs().mean() / math.sqrt(Qp))
+            # self.alpha.data.copy_(self.weight.abs().max() / 2 ** (self.nbits - 1))
+            self.init_state.fill_(1)
+        g = 1.0 / math.sqrt(self.weight.numel() * Qp)
+
+        # Method1:
+        alpha = grad_scale(self.alpha, g)
+        alpha = alpha.unsqueeze(1)
+        w_q = round_pass((self.weight / alpha).clamp(Qn, Qp)) * alpha
+
+        x = self.act(x)
+        return x
+
+    def forward(self, x):
+        if self.alpha is None:
+            return F.linear(x, self.weight, self.bias)
+        Qn = -2 ** (self.nbits - 1)
+        Qp = 2 ** (self.nbits - 1) - 1
+        if self.training and self.init_state == 0:
+            self.alpha.data.copy_(2 * self.weight.abs().mean() / math.sqrt(Qp))
+            # self.alpha.data.copy_(self.weight.abs().max() / 2 ** (self.nbits - 1))
+            self.init_state.fill_(1)
+        g = 1.0 / math.sqrt(self.weight.numel() * Qp)
+
+        # Method1:
+        alpha = grad_scale(self.alpha, g)
+        alpha = alpha.unsqueeze(1)
+        w_q = round_pass((self.weight / alpha).clamp(Qn, Qp)) * alpha
+
+        # x = self.act(x)
+        # w = self.weight / alpha
+        # w = w.clamp(Qn, Qp)
+        # q_w = round_pass(w)
+        # w_q = q_w * alpha
+
+        # Method2:
+        # w_q = FunLSQ.apply(self.weight, self.alpha, g, Qn, Qp)
+        # import pdb; pdb.set_trace()
+        return F.linear(x, w_q)
+
 class Q_Attention(nn.Module):
      
     def __init__(self, nbits, dim, num_heads=8, quantize_attn=True, qkv_bias=False, attn_drop=0., proj_drop=0.):
@@ -174,11 +229,11 @@ class Q_Attention(nn.Module):
 
         if self.quantize_attn:
 
-            self.qkv = LinearQ(dim, dim * 3, bias=qkv_bias, nbits_w=nbits, mode=Qmodes.kernel_wise)
+            self.qkv = LinearQ_v2(dim, dim * 3, bias=qkv_bias, nbits_w=nbits, mode=Qmodes.kernel_wise)
 
             self.attn_drop = nn.Dropout(attn_drop)
 
-            self.proj = LinearQ(dim, dim, nbits_w=nbits, mode=Qmodes.kernel_wise)
+            self.proj = LinearQ_v2(dim, dim, nbits_w=nbits, mode=Qmodes.kernel_wise)
             self.q_act = ActQ(nbits_a=nbits, in_features=self.num_heads)
             self.k_act = ActQ(nbits_a=nbits, in_features=self.num_heads)
             self.v_act = ActQ(nbits_a=nbits, in_features=self.num_heads)
@@ -197,27 +252,41 @@ class Q_Attention(nn.Module):
     def forward(self, x0):
         assert not np.isnan(x0).any()
         B, N, C = x0.shape
-        qkv = self.qkv(x0).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        x0_2b = np.round(self.qkv.act(x0) / self.qkv.act.alpha.mean() + self.qkv.act.zero_point.mean()).int()
+        qkv_bias = (-self.qkv(self.qkv.act.zero_point.mean() * self.qkv.act.alpha.mean() * np.ones_like(x0)) + self.qkv.bias)  / self.qkv.act.alpha.mean()
+        qkv = (self.qkv(x0_2b.float()) + qkv_bias).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
 
         q0, k0, v0 = qkv.unbind(0)   # make torchscript happy (cannot use tensor as tuple)
         q1 = self.norm_q(q0)
         k1 = self.norm_k(k0)
 
+        # q2 = self.q_act(q1)
         q2 = self.q_act(q1)
+        q2_2b = np.round(q2 / self.q_act.alpha.mean()).int()
+        # k2 = self.k_act(k1)
         k2 = self.k_act(k1)
-        v2 = self.v_act(v0)
+        k2_2b = np.round(k2 / self.k_act.alpha.mean()).int()
+        v2 = self.v_act(v0 * self.qkv.act.alpha.mean())
+        v2_2b = np.round(v2 / self.v_act.alpha.mean()).int()
 
-        attn = (q2 @ k2.transpose(-2, -1)) * self.scale
+        attn = (q2_2b @ k2_2b.transpose(-2, -1)) * self.scale * self.q_act.alpha.mean() * self.k_act.alpha.mean()
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
         attn = self.attn_act(attn)
+        attn_2bfp = attn / self.attn_act.alpha.mean()
+        attn_2b = np.round(attn_2bfp).int()
 
-        x1 = (attn @ v2).transpose(1, 2).reshape(B, N, C)
+        # x1 = (attn @ v2).transpose(1, 2).reshape(B, N, C)
+        x1_32b = (attn_2b @ v2_2b).transpose(1, 2).reshape(B, N, C)
+        x1_2bfp = self.proj.act(x1_32b * self.attn_act.alpha.mean() * self.v_act.alpha.mean()) / self.proj.act.alpha.mean() # + bias
+        x1_2b = np.round(x1_2bfp).int()
+        x1 = x1_32b * self.attn_act.alpha.mean() * self.v_act.alpha.mean()
+        x2 = self.proj(x1_2b.float())
 
-        x2 = self.proj(x1)
+        # x2_bak = self.proj(x1)
         x3 = self.proj_drop(x2)
         # import pdb; pdb.set_trace()
-        return x3
+        return x3 * self.proj.act.alpha.mean() + self.proj.bias
 
 class Q_Block(nn.Module):
 
