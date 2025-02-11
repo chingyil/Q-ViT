@@ -184,28 +184,30 @@ class Q_Attention(nn.Module):
         
         self.proj_drop = nn.Dropout(proj_drop)
 
-    def forward(self, x):
-        B, N, C = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+    def forward(self, x0):
+        assert not np.isnan(x0).any()
+        B, N, C = x0.shape
+        qkv = self.qkv(x0).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
 
-        q, k, v = qkv.unbind(0)   # make torchscript happy (cannot use tensor as tuple)
-        q = self.norm_q(q)
-        k = self.norm_k(k)
+        q0, k0, v0 = qkv.unbind(0)   # make torchscript happy (cannot use tensor as tuple)
+        q1 = self.norm_q(q0)
+        k1 = self.norm_k(k0)
 
-        q = self.q_act(q)
-        k = self.k_act(k)
-        v = self.v_act(v)
+        q2 = self.q_act(q1)
+        k2 = self.k_act(k1)
+        v2 = self.v_act(v0)
 
-        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = (q2 @ k2.transpose(-2, -1)) * self.scale
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
         attn = self.attn_act(attn)
 
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x1 = (attn @ v2).transpose(1, 2).reshape(B, N, C)
 
-        x = self.proj(x)
-        x = self.proj_drop(x)
-        return x
+        x2 = self.proj(x1)
+        x3 = self.proj_drop(x2)
+        # import pdb; pdb.set_trace()
+        return x3
 
 
 class Q_Block(nn.Module):
@@ -221,10 +223,11 @@ class Q_Block(nn.Module):
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = Q_Mlp(nbits=nbits, in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
 
-    def forward(self, x):
-        x = x + self.drop_path(self.attn(self.norm1(x)))
-        x = x + self.drop_path(self.mlp(self.norm2(x)))
-        return x
+    def forward(self, x0):
+        x1 = x0 + self.drop_path(self.attn(self.norm1(x0)))
+        x2 = x1 + self.drop_path(self.mlp(self.norm2(x1)))
+        # import pdb; pdb.set_trace()
+        return x2
 
 class Q_PatchEmbed(nn.Module):
     """ Image to Patch Embedding
@@ -282,6 +285,7 @@ class lowbit_VisionTransformer(nn.Module):
             norm_layer: (nn.Module): normalization layer
             weight_init: (str): weight init scheme
         """
+        # import pdb; pdb.set_trace()
         super().__init__()
         self.num_classes = num_classes
         self.num_features = self.embed_dim = embed_dim  # num_features for consistency with other models
@@ -364,20 +368,24 @@ class lowbit_VisionTransformer(nn.Module):
         if self.num_tokens == 2:
             self.head_dist = nn.Linear(self.embed_dim, self.num_classes) if num_classes > 0 else nn.Identity()
 
-    def forward_features(self, x):
-        x = self.patch_embed(x)
-        cls_token = self.cls_token.expand(x.shape[0], -1, -1)  # stole cls_tokens impl from Phil Wang, thanks
+    def forward_features(self, x0):
+        x1 = self.patch_embed(x0)
+        assert not np.isnan(x1).any()
+        cls_token = self.cls_token.expand(x1.shape[0], -1, -1)  # stole cls_tokens impl from Phil Wang, thanks
         if self.dist_token is None:
-            x = torch.cat((cls_token, x), dim=1)
+            x2 = torch.cat((cls_token, x1), dim=1)
         else:
-            x = torch.cat((cls_token, self.dist_token.expand(x.shape[0], -1, -1), x), dim=1)
-        x = self.pos_drop(x + self.pos_embed)
-        x = self.blocks(x)
-        x = self.norm(x)
+            x2 = torch.cat((cls_token, self.dist_token.expand(x1.shape[0], -1, -1), x1), dim=1)
+        assert not np.isnan(x2).any()
+        x3 = self.pos_drop(x2 + self.pos_embed)
+        assert not np.isnan(x3).any()
+        x4 = self.blocks(x3)
+        x5 = self.norm(x4)
+        # import pdb; pdb.set_trace()
         if self.dist_token is None:
-            return self.pre_logits(x[:, 0])
+            return self.pre_logits(x5[:, 0])
         else:
-            return x[:, 0], x[:, 1]
+            return x5[:, 0], x5[:, 1]
 
     def forward(self, x):
         x = self.forward_features(x)

@@ -4,7 +4,7 @@ import torch
 from functools import partial
 import torch.nn as nn
 # from timm.models.registry import register_model
-from quant_vision_transformer import lowbit_VisionTransformer #, _cfg
+from quant_vision_transformer_v2 import lowbit_VisionTransformer #, _cfg
 
 # model = timm.models.create_model("vit_small_patch16_224", pretrained=True)
 # model = timm.models.create_model("fourbits_deit_small_patch16_224", pretrained=True)
@@ -81,7 +81,7 @@ data_path_train = "/Volumes/PortableSSD/imagenet/imagenet"
 # dataset_train = datasets.ImageNet(root=root_train, split='val')
 # import pdb; pdb.set_trace()
 
-batch_size = 8
+batch_size = 32
 num_workers = 0
 pin_mem = True
 # data_loader_train = torch.utils.data.DataLoader(
@@ -110,7 +110,7 @@ dataset_val_sub = torch.utils.data.Subset(dataset_val, np.arange(1000).astype(np
 
 data_loader_val = torch.utils.data.DataLoader(
     dataset_val_sub, # sampler=sampler_val,
-    batch_size=int(1.5 * batch_size),
+    batch_size=batch_size,
     num_workers=num_workers,
     pin_memory=pin_mem,
     drop_last=False
