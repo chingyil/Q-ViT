@@ -3,10 +3,221 @@ import torch.nn as nn
 from functools import partial
 from collections import OrderedDict
 from quant_vision_transformer import Q_PatchEmbed, Q_Attention, Q_Mlp
-from Quant import LinearQ, ActQ
+from Quant import round_pass, ActQ, grad_scale
+from _quan_base import Qmodes, _ActQ, _LinearQ
 from timm.models.layers.weight_init import trunc_normal_
 import numpy as np
 from timm.models.layers.drop import DropPath
+import math
+import torch.nn.functional as F
+
+class ActQ(_ActQ):
+    def __init__(self, in_features, nbits_a=4, mode=Qmodes.kernel_wise, **kwargs):
+        super(ActQ, self).__init__(in_features=in_features, nbits=nbits_a, mode=mode)
+        # print(self.alpha.shape, self.zero_point.shape)
+    def forward(self, x0):
+        if self.alpha is None:
+            return x0
+
+        if self.training and self.init_state == 0:
+            # The init alpha for activation is very very important as the experimental results shows.
+            # Please select a init_rate for activation.
+            # self.alpha.data.copy_(x0.max() / 2 ** (self.nbits - 1) * self.init_rate)
+            if x0.min() < -1e-5:
+                self.signed.data.fill_(1)
+            if self.signed == 1:
+                Qn = -2 ** (self.nbits - 1)
+                Qp = 2 ** (self.nbits - 1) - 1
+            else:
+                Qn = 0
+                Qp = 2 ** self.nbits - 1
+            self.alpha.data.copy_(2 * x0.abs().mean() / math.sqrt(Qp))
+            self.zero_point.data.copy_(self.zero_point.data * 0.9 + 0.1 * (torch.min(x0.detach()) - self.alpha.data * Qn))
+            self.init_state.fill_(1)
+
+        if self.signed == 1:
+            Qn = -2 ** (self.nbits - 1)
+            Qp = 2 ** (self.nbits - 1) - 1
+        else:
+            Qn = 0
+            Qp = 2 ** self.nbits - 1
+
+        g = 1.0 / math.sqrt(x0.numel() * Qp)
+
+        # Method1:
+        zero_point = (self.zero_point.round() - self.zero_point).detach() + self.zero_point
+        # alpha = grad_scale(self.alpha, g)
+        # zero_point = grad_scale(zero_point, g)
+        alpha = self.alpha
+        # x0 = round_pass((x0 / alpha).clamp(Qn, Qp)) * alpha
+        if len(x0.shape)==2:
+            alpha = alpha.unsqueeze(0)
+            zero_point = zero_point.unsqueeze(0)
+        elif len(x0.shape)==4:
+            alpha = alpha.unsqueeze(0).unsqueeze(2).unsqueeze(3)
+            zero_point = zero_point.unsqueeze(0).unsqueeze(2).unsqueeze(3)
+
+        alpha = self.alpha.mean()
+        zero_point = zero_point.mean()
+
+        x1 = round_pass((x0 / alpha + zero_point).clamp(Qn, Qp))
+        x2 = (x1 - zero_point) * alpha
+
+        if np.isnan(x2).any():
+            import pdb; pdb.set_trace()
+        # import pdb; pdb.set_trace()
+        return x2
+
+class ActQ_v2(_ActQ):
+    def __init__(self, in_features, nbits_a=4, mode=Qmodes.kernel_wise, **kwargs):
+        super(ActQ, self).__init__(in_features=in_features, nbits=nbits_a, mode=mode)
+        # print(self.alpha.shape, self.zero_point.shape)
+    def forward(self, x0):
+        if self.alpha is None:
+            return x0
+
+        if self.training and self.init_state == 0:
+            # The init alpha for activation is very very important as the experimental results shows.
+            # Please select a init_rate for activation.
+            # self.alpha.data.copy_(x0.max() / 2 ** (self.nbits - 1) * self.init_rate)
+            if x0.min() < -1e-5:
+                self.signed.data.fill_(1)
+            if self.signed == 1:
+                Qn = -2 ** (self.nbits - 1)
+                Qp = 2 ** (self.nbits - 1) - 1
+            else:
+                Qn = 0
+                Qp = 2 ** self.nbits - 1
+            self.alpha.data.copy_(2 * x0.abs().mean() / math.sqrt(Qp))
+            self.zero_point.data.copy_(self.zero_point.data * 0.9 + 0.1 * (torch.min(x0.detach()) - self.alpha.data * Qn))
+            self.init_state.fill_(1)
+
+        if self.signed == 1:
+            Qn = -2 ** (self.nbits - 1)
+            Qp = 2 ** (self.nbits - 1) - 1
+        else:
+            Qn = 0
+            Qp = 2 ** self.nbits - 1
+
+        g = 1.0 / math.sqrt(x0.numel() * Qp)
+
+        # Method1:
+        zero_point = (self.zero_point.round() - self.zero_point).detach() + self.zero_point
+        # alpha = grad_scale(self.alpha, g)
+        # zero_point = grad_scale(zero_point, g)
+        alpha = self.alpha
+        # x0 = round_pass((x0 / alpha).clamp(Qn, Qp)) * alpha
+        if len(x0.shape)==2:
+            alpha = alpha.unsqueeze(0)
+            zero_point = zero_point.unsqueeze(0)
+        elif len(x0.shape)==4:
+            alpha = alpha.unsqueeze(0).unsqueeze(2).unsqueeze(3)
+            zero_point = zero_point.unsqueeze(0).unsqueeze(2).unsqueeze(3)
+
+        alpha = self.alpha.mean()
+        zero_point = zero_point.mean()
+
+        x1 = round_pass((x0 / alpha + zero_point).clamp(Qn, Qp))
+        x2 = (x1 - zero_point) * alpha
+
+        if np.isnan(x2).any():
+            import pdb; pdb.set_trace()
+        # import pdb; pdb.set_trace()
+        return x2
+
+class LinearQ(_LinearQ):
+    def __init__(self, in_features, out_features, bias=True, nbits_w=4, **kwargs):
+        super(LinearQ, self).__init__(in_features=in_features,
+                                        out_features=out_features, bias=bias, nbits=nbits_w, mode=Qmodes.kernel_wise)
+        self.act = ActQ(in_features=in_features, nbits_a=nbits_w)
+
+    def forward(self, x):
+        if self.alpha is None:
+            return F.linear(x, self.weight, self.bias)
+        Qn = -2 ** (self.nbits - 1)
+        Qp = 2 ** (self.nbits - 1) - 1
+        if self.training and self.init_state == 0:
+            self.alpha.data.copy_(2 * self.weight.abs().mean() / math.sqrt(Qp))
+            # self.alpha.data.copy_(self.weight.abs().max() / 2 ** (self.nbits - 1))
+            self.init_state.fill_(1)
+        g = 1.0 / math.sqrt(self.weight.numel() * Qp)
+
+        # Method1:
+        alpha = grad_scale(self.alpha, g)
+        alpha = alpha.unsqueeze(1)
+        w_q = round_pass((self.weight / alpha).clamp(Qn, Qp)) * alpha
+
+        x = self.act(x)
+        # w = self.weight / alpha
+        # w = w.clamp(Qn, Qp)
+        # q_w = round_pass(w)
+        # w_q = q_w * alpha
+
+        # Method2:
+        # w_q = FunLSQ.apply(self.weight, self.alpha, g, Qn, Qp)
+        # import pdb; pdb.set_trace()
+        return F.linear(x, w_q, self.bias)
+
+class Q_Attention(nn.Module):
+     
+    def __init__(self, nbits, dim, num_heads=8, quantize_attn=True, qkv_bias=False, attn_drop=0., proj_drop=0.):
+        super().__init__()
+        assert dim % num_heads == 0, 'dim should be divisible by num_heads'
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = head_dim ** -0.5
+        self.quantize_attn = quantize_attn
+        
+        self.norm_q = nn.LayerNorm(head_dim)
+        self.norm_k = nn.LayerNorm(head_dim)
+
+
+        if self.quantize_attn:
+
+            self.qkv = LinearQ(dim, dim * 3, bias=qkv_bias, nbits_w=nbits, mode=Qmodes.kernel_wise)
+
+            self.attn_drop = nn.Dropout(attn_drop)
+
+            self.proj = LinearQ(dim, dim, nbits_w=nbits, mode=Qmodes.kernel_wise)
+            self.q_act = ActQ(nbits_a=nbits, in_features=self.num_heads)
+            self.k_act = ActQ(nbits_a=nbits, in_features=self.num_heads)
+            self.v_act = ActQ(nbits_a=nbits, in_features=self.num_heads)
+            self.attn_act = ActQ(nbits_a=nbits, in_features=self.num_heads)
+        else:
+            self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+            self.attn_drop = nn.Dropout(attn_drop)
+            self.proj = nn.Linear(dim, dim)
+            self.q_act = ActQ(nbits_a=nbits, in_features=self.num_heads)
+            self.k_act = ActQ(nbits_a=nbits, in_features=self.num_heads)
+            self.v_act = ActQ(nbits_a=nbits, in_features=self.num_heads)
+            self.attn_act = ActQ(nbits_a=nbits, in_features=self.num_heads)
+        
+        self.proj_drop = nn.Dropout(proj_drop)
+
+    def forward(self, x0):
+        assert not np.isnan(x0).any()
+        B, N, C = x0.shape
+        qkv = self.qkv(x0).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+
+        q0, k0, v0 = qkv.unbind(0)   # make torchscript happy (cannot use tensor as tuple)
+        q1 = self.norm_q(q0)
+        k1 = self.norm_k(k0)
+
+        q2 = self.q_act(q1)
+        k2 = self.k_act(k1)
+        v2 = self.v_act(v0)
+
+        attn = (q2 @ k2.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+        attn = self.attn_act(attn)
+
+        x1 = (attn @ v2).transpose(1, 2).reshape(B, N, C)
+
+        x2 = self.proj(x1)
+        x3 = self.proj_drop(x2)
+        # import pdb; pdb.set_trace()
+        return x3
 
 class Q_Block(nn.Module):
 
@@ -25,7 +236,7 @@ class Q_Block(nn.Module):
     def forward(self, x0):
         x1 = x0 + self.drop_path(self.attn(self.norm1(x0)))
         x2 = x1 + self.drop_path(self.mlp(self.norm2(x1)))
-        print(np.percentile(x0, (0, 5, 95, 100)), x0.std())
+        # print(np.percentile(x0, (0, 5, 95, 100)), x0.std())
         # import pdb; pdb.set_trace()
         return x2
 
@@ -101,7 +312,7 @@ class lowbit_VisionTransformer(nn.Module):
         self.head = LinearQ(self.num_features, num_classes, nbits_w=8) if num_classes > 0 else nn.Identity()
         # nn.Linear(self.num_features, num_classes) if num_classes > 0 else nn.Identity()
         self.head_dist = LinearQ(self.embed_dim, self.num_classes, nbits_w=8) if num_classes > 0 else nn.Identity()
-        import pdb; pdb.set_trace()
+        # import pdb; pdb.set_trace()
 
     def forward_features(self, x0):
         x1 = self.patch_embed(x0)
