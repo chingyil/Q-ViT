@@ -4,7 +4,7 @@ from torch.nn.modules.linear import Linear
 import math
 from torch.nn.parameter import Parameter
 from _quan_base import _Conv2dQ, Qmodes, _LinearQ, _ActQ
-
+import numpy as np
 
 __all__ = ['Conv2dQ', 'LinearQ', 'ActQ']
 
@@ -123,7 +123,7 @@ class LinearQ(_LinearQ):
         alpha = alpha.unsqueeze(1)
         w_q = round_pass((self.weight / alpha).clamp(Qn, Qp)) * alpha
 
-        x = self.act(x)
+        xq = self.act(x)
         # w = self.weight / alpha
         # w = w.clamp(Qn, Qp)
         # q_w = round_pass(w)
@@ -131,22 +131,23 @@ class LinearQ(_LinearQ):
 
         # Method2:
         # w_q = FunLSQ.apply(self.weight, self.alpha, g, Qn, Qp)
-        return F.linear(x, w_q, self.bias)
+        # import pdb; pdb.set_trace()
+        return F.linear(xq, w_q, self.bias)
 
 
 class ActQ(_ActQ):
     def __init__(self, in_features, nbits_a=4, mode=Qmodes.kernel_wise, **kwargs):
         super(ActQ, self).__init__(in_features=in_features, nbits=nbits_a, mode=mode)
         # print(self.alpha.shape, self.zero_point.shape)
-    def forward(self, x):
+    def forward(self, x0):
         if self.alpha is None:
-            return x
+            return x0
 
         if self.training and self.init_state == 0:
             # The init alpha for activation is very very important as the experimental results shows.
             # Please select a init_rate for activation.
-            # self.alpha.data.copy_(x.max() / 2 ** (self.nbits - 1) * self.init_rate)
-            if x.min() < -1e-5:
+            # self.alpha.data.copy_(x0.max() / 2 ** (self.nbits - 1) * self.init_rate)
+            if x0.min() < -1e-5:
                 self.signed.data.fill_(1)
             if self.signed == 1:
                 Qn = -2 ** (self.nbits - 1)
@@ -154,8 +155,8 @@ class ActQ(_ActQ):
             else:
                 Qn = 0
                 Qp = 2 ** self.nbits - 1
-            self.alpha.data.copy_(2 * x.abs().mean() / math.sqrt(Qp))
-            self.zero_point.data.copy_(self.zero_point.data * 0.9 + 0.1 * (torch.min(x.detach()) - self.alpha.data * Qn))
+            self.alpha.data.copy_(2 * x0.abs().mean() / math.sqrt(Qp))
+            self.zero_point.data.copy_(self.zero_point.data * 0.9 + 0.1 * (torch.min(x0.detach()) - self.alpha.data * Qn))
             self.init_state.fill_(1)
 
         if self.signed == 1:
@@ -165,21 +166,24 @@ class ActQ(_ActQ):
             Qn = 0
             Qp = 2 ** self.nbits - 1
 
-        g = 1.0 / math.sqrt(x.numel() * Qp)
+        g = 1.0 / math.sqrt(x0.numel() * Qp)
 
         # Method1:
         zero_point = (self.zero_point.round() - self.zero_point).detach() + self.zero_point
         alpha = grad_scale(self.alpha, g)
         zero_point = grad_scale(zero_point, g)
-        # x = round_pass((x / alpha).clamp(Qn, Qp)) * alpha
-        if len(x.shape)==2:
+        # x0 = round_pass((x0 / alpha).clamp(Qn, Qp)) * alpha
+        if len(x0.shape)==2:
             alpha = alpha.unsqueeze(0)
             zero_point = zero_point.unsqueeze(0)
-        elif len(x.shape)==4:
+        elif len(x0.shape)==4:
             alpha = alpha.unsqueeze(0).unsqueeze(2).unsqueeze(3)
             zero_point = zero_point.unsqueeze(0).unsqueeze(2).unsqueeze(3)
 
-        x = round_pass((x / alpha + zero_point).clamp(Qn, Qp))
-        x = (x - zero_point) * alpha
+        x1 = round_pass((x0 / self.alpha.mean() + self.zero_point.mean()).clamp(Qn, Qp))
+        x2 = (x1 - self.zero_point.mean()) * self.alpha.mean()
 
-        return x
+        if np.isnan(x2).any():
+            import pdb; pdb.set_trace()
+        # import pdb; pdb.set_trace()
+        return x2
