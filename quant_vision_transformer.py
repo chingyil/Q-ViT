@@ -120,6 +120,7 @@ default_cfgs = {
         input_size=(3, 384, 384), crop_pct=1.0),
 }
 
+
 class Q_Mlp(nn.Module):
     """ MLP as used in Vision Transformer, MLP-Mixer and related networks
     """
@@ -135,17 +136,17 @@ class Q_Mlp(nn.Module):
         self.fc2 = LinearQ(hidden_features, out_features, nbits_w=nbits, mode=Qmodes.kernel_wise)
         self.drop2 = nn.Dropout(drop_probs[1])
 
-    def forward(self, x):
-        x = self.fc1(x)
+    def forward(self, x0):
+        x1 = self.fc1(x0)
         # print(torch.max(x), torch.min(x))
-        x = self.act(x)
+        x2 = self.act(x1)
         
-        x = torch.clip(x, -10., 10.)
+        x2_clipped = torch.clip(x2, -10., 10.)
         # print(torch.clip(x, -10., 10.))
-        x = self.drop1(x)
-        x = self.fc2(x)
-        x = self.drop2(x)
-        return x
+        x2_clipped_dropped = self.drop1(x2_clipped)
+        x3 = self.fc2(x2_clipped_dropped)
+        x3_dropped = self.drop2(x3)
+        return x3_dropped
 
 
 class Q_Attention(nn.Module):

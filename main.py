@@ -171,10 +171,13 @@ def get_args_parser():
     parser.add_argument('--world_size', default=1, type=int,
                         help='number of distributed processes')
     parser.add_argument('--dist_url', default='env://', help='url used to set up distributed training')
+    # parser.add_argument('--gpu', default='cpu', type=str)
+    parser.add_argument('--gpu', default=0, type=int)
     return parser
 
 
 def main(args):
+    # import pdb; pdb.set_trace()
     utils.init_distributed_mode(args)
     # utils.setup_distributed()
 

@@ -4,15 +4,18 @@ import torch
 from functools import partial
 import torch.nn as nn
 # from timm.models.registry import register_model
-from quant_vision_transformer_v2 import lowbit_VisionTransformer #, _cfg
+from quant_vision_transformer_v3 import lowbit_VisionTransformer #, _cfg
 
 # model = timm.models.create_model("vit_small_patch16_224", pretrained=True)
 # model = timm.models.create_model("fourbits_deit_small_patch16_224", pretrained=True)
 # model = timm.models.create_model("threebits_deit_small_patch16_224", pretrained=False)
 model = lowbit_VisionTransformer(
         nbits=3, patch_size=16, embed_dim=384, depth=12, num_heads=6, mlp_ratio=4, qkv_bias=True,
-        norm_layer=partial(nn.LayerNorm, eps=1e-6))
-model.load_state_dict(torch.load("/Users/chingyilin/Downloads/best_checkpoint_3bit.pth", weights_only=False, map_location=torch.device('cpu'))['model'])
+        norm_layer=partial(nn.LayerNorm, eps=1e-6), num_classes=10)
+# model.load_state_dict(torch.load("/Users/chingyilin/Downloads/best_checkpoint_3bit.pth", weights_only=False, map_location=torch.device('cpu'))['model'])
+pth = torch.load("/Users/chingyilin/Projects/Q-ViT/3bit_cifar10.pth", weights_only=False, map_location=torch.device('cpu'))
+# pth = torch.load("/Users/chingyilin/Projects/Q-ViT/2bit_cifar10.pth", weights_only=False, map_location=torch.device('cpu'))
+model.load_state_dict(pth['model'])
 from timm.models.registry import _model_entrypoints
 # import pdb; pdb.set_trace()
 model_names = _model_entrypoints.keys()
@@ -81,7 +84,7 @@ data_path_train = "/Volumes/PortableSSD/imagenet/imagenet"
 # dataset_train = datasets.ImageNet(root=root_train, split='val')
 # import pdb; pdb.set_trace()
 
-batch_size = 32
+batch_size = 32 #128
 num_workers = 0
 pin_mem = True
 # data_loader_train = torch.utils.data.DataLoader(
@@ -92,8 +95,9 @@ pin_mem = True
 #     drop_last=True,
 # )
 
+data_path_val = "/Users/chingyilin/Documents/cifar-100-python"
 # data_path_val = "/Volumes/PortableSSD/imagenet/ILSVRC2012_img_train_t3_bak"
-data_path_val = "/Volumes/PortableSSD/imagenet/imagenet"
+# data_path_val = "/Volumes/PortableSSD/imagenet/imagenet"
 # root_train = os.path.join(data_path_train)
 root_val = os.path.join(data_path_val)
 transform_val = build_transform(is_train=False)
@@ -105,8 +109,10 @@ transform_val = build_transform(is_train=False)
 
 import numpy as np
 # dataset_val = datasets.ImageFolder(root_val, transform=transform_val, is_valid_file=check_valid)
-dataset_val = datasets.ImageNet(root=root_val, split='val', transform=transform_val, is_valid_file=check_valid)
-dataset_val_sub = torch.utils.data.Subset(dataset_val, np.arange(1000).astype(np.int32))
+# dataset_val = datasets.ImageNet(root=root_val, split='val', transform=transform_val, is_valid_file=check_valid)
+# dataset_val = datasets.CIFAR10(root=root_val, train=False, transform=transform_val, download=True)
+dataset_val = datasets.CIFAR100(root=root_val, train=False, transform=transform_val, download=True)
+dataset_val_sub = torch.utils.data.Subset(dataset_val, np.arange(100).astype(np.int32))
 
 data_loader_val = torch.utils.data.DataLoader(
     dataset_val_sub, # sampler=sampler_val,
@@ -117,6 +123,6 @@ data_loader_val = torch.utils.data.DataLoader(
 )
 
 device = torch.device('cpu')
-import pdb; pdb.set_trace()
+# import pdb; pdb.set_trace()
 evaluate(data_loader_val, model, device)
 import pdb; pdb.set_trace()
