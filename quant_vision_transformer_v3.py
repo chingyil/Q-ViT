@@ -12,6 +12,31 @@ import math
 import torch.nn.functional as F
 from timm.models.layers.helpers import to_2tuple
 
+def arr2s(x, nbit=16, start=2, prefix=""):
+    return "\n".join([(prefix + hex(int(p) % (2 ** nbit))[start:]) for p in x.tolist()])
+
+def arr2single(x, nbit=16, start=2, prefix=""):
+    # return " ".join("%d" % xx for xx in x)
+    if nbit == 1:
+        b = "".join([format(int(xx), "01b") for xx in reversed(x)])
+    elif nbit == 3:
+        b = "".join([format(int(xx), "03b") for xx in reversed(x)])
+        # bpad = "0" * ((4 - 1) - ((len(b) + 1) % 4)) + b
+        assert len(b) % 4 == 0, print("b = ", b)
+    elif nbit == 16:
+        b = "".join([format(int(xx) % (2 ** 16), "016b") for xx in reversed(x)])
+    elif nbit == 32:
+        b = "".join([format(int(xx), "032b") for xx in reversed(x)])
+        # import pdb; pdb.set_trace()
+    # idxs = [i for i in range(0, len(b), 4)]
+    tokens = [format(int(b[i:i+4], 2), "1x") for i in range(0, len(b), 4)]
+    return "".join(tokens)
+
+def arr2d2s(x, nbit=16, start=2, prefix=""):
+    assert len(x.shape) == 2
+    return "\n".join([arr2single(xx, nbit=nbit) for xx in x])
+    # return "\n".join([(prefix + hex(int(p) % (2 ** nbit))[start:]) for p in x.tolist()])
+
 class ActQ_v2(_ActQ):
     def __init__(self, in_features, nbits_a=4, mode=Qmodes.kernel_wise, **kwargs):
         super(ActQ_v2, self).__init__(in_features=in_features, nbits=nbits_a, mode=mode)
@@ -89,6 +114,28 @@ class Q_Mlp(nn.Module):
         x2_dropped = self.drop2(x2)
         return x2_dropped
 
+def mean_var(x, scale=1024):
+    means = torch.zeros_like(x).int()
+    varns = torch.zeros_like(x).int()
+    for i in range(x.shape[3]):
+        if i > 1:
+            # means[:,:,:,i] = means[:,:,:,i - 1] + (x[:,:,:,i] - means[:,:,:,i - 1]) / (i + 1)
+            means[:,:,:,i] = means[:,:,:,i - 1] + (((x[:,:,:,i] - means[:,:,:,i - 1]) * int(scale / (i + 1)))) // scale
+            varns[:,:,:,i] = varns[:,:,:,i - 1] + (x[:,:,:,i] - means[:,:,:,i - 1]) * (x[:,:,:,i] - means[:,:,:,i])
+        elif i > 0:
+            # means[:,:,:,i] = means[:,:,:,i - 1] + (x[:,:,:,i] - means[:,:,:,i - 1]) / (i + 1)
+            means[:,:,:,i] = means[:,:,:,i - 1] + (((x[:,:,:,i] - means[:,:,:,i - 1]) * int(scale / (i + 1)))) // scale
+            varns[:,:,:,i] = varns[:,:,:,i - 1] + (x[:,:,:,i] - means[:,:,:,i - 1]) * (x[:,:,:,i] - means[:,:,:,i])
+        else:
+            means[:,:,:,i] = x[:,:,:,i]
+            varns[:,:,:,i] = varns[:,:,:,i - 1] + (x[:,:,:,i] - 0) * (x[:,:,:,i] - means[:,:,:,i])
+
+    # print(varns[:,:,:,-1][0,0,0], (x[0,0,0].std() ** 2) * x.shape[3])
+    # import pdb; pdb.set_trace()
+    mu = means[:,:,:,-1].unsqueeze(3)
+    varn = varns[:,:,:,-1].unsqueeze(3) / x.shape[3]
+    return mu, varn
+
 class Q_Attention(nn.Module):
      
     def __init__(self, nbits, dim, num_heads=8, quantize_attn=True, qkv_bias=False, attn_drop=0., proj_drop=0.):
@@ -128,33 +175,38 @@ class Q_Attention(nn.Module):
         x1 = round_pass((x * scale / alpha).clamp(Qn, Qp))
         return x1.int()
 
-    def scaled_norm_qact_q(self, x):
-        scale = self.qkv.alpha.reshape(3, self.num_heads, 1, -1)[0]
-        q1 = ((x * scale) - torch.mean(x * scale, (3,), keepdim=True)) / (torch.std(x * scale, (3,), keepdim=True) + 1e-5)
+    def scaled_norm_qact_q(self, x, prescale=1):
+        scale = self.qkv.alpha.reshape(3, self.num_heads, 1, -1)[0] * prescale
+        mean, varn = mean_var((x * scale).int())
+        q1 = ((x * scale) - mean) / (torch.sqrt(varn) + 1e-5)
+        # q1 = ((x * scale) - torch.mean(x * scale, (3,), keepdim=True)) / (torch.std(x * scale, (3,), keepdim=True) + 1e-5)
         q2_2b = self.q_act_scaled((q1 + self.norm_q.bias / self.norm_q.weight)).int()
-        import pdb; pdb.set_trace()
+        # import pdb; pdb.set_trace()
         return q2_2b
 
 
-    def scaled_norm_qact_k(self, x):
-        scale = self.qkv.alpha.reshape(3, self.num_heads, 1, -1)[1]
+    def scaled_norm_qact_k(self, x, prescale=1):
+        scale = self.qkv.alpha.reshape(3, self.num_heads, 1, -1)[1] * prescale
 
+        mean, varn = mean_var((x * scale).int())
         # k1 = self.norm_k(x)
-        k1 = ((x * scale) - torch.mean(x * scale, (3,), keepdim=True)) / (torch.std(x * scale, (3,), keepdim=True) + 1e-5)
+        # k1 = ((x * scale) - torch.mean(x * scale, (3,), keepdim=True)) / (torch.std(x * scale, (3,), keepdim=True) + 1e-5)
+        k1 = ((x * scale) - mean) / (torch.sqrt(varn) + 1e-5)
         # k2 = self.k_act(k1)
         # k2_2b = np.round(k2 / self.k_act.alpha.mean()).int()
         k2_2b = self.k_act((k1 + self.norm_k.bias / self.norm_k.weight) * self.norm_k.weight).int()
-        import pdb; pdb.set_trace()
+        # import pdb; pdb.set_trace()
         return k2_2b
 
     def scaled_softmax_qact(self, x, div=128):
         scale = self.scale * self.q_act.alpha.mean() * self.k_act.alpha.mean()
-        exp = (1 / np.log(2) * scale * x * div).int()
-        attn_exp = 2 ** (exp / div).round()
+        exp = (1 / np.log(2) * scale * x)
+        # attn_exp = (2 ** exp.floor()) * (2 ** (exp - exp.floor()))
+        attn_exp = (2 ** exp.floor()) * (1 + (exp - exp.floor()))
         attn_exp_dropped = self.attn_drop(attn_exp)
         attn_2b = self.attn_act(attn_exp_dropped * (1 / attn_exp.sum((-1,)).unsqueeze(-1))).int()
-        self.attn_act((2 ** (exp / div)) * (1 / (2 ** (exp / div)).sum((-1,)).unsqueeze(-1))).int()
-        import pdb; pdb.set_trace()
+                #   self.attn_act((2 ** (exp / div)) * (1 / (2 ** (exp / div)).sum((-1,)).unsqueeze(-1))).int()
+        # import pdb; pdb.set_trace()
         return attn_2b
 
     def qkv_bias(self, x):
@@ -194,7 +246,17 @@ class Q_Attention(nn.Module):
         assert not np.isnan(x0).any()
         B, N, C = x0.shape
         x0_2b = self.qkv.act(x0).int()
-        # open("input_data_v2.txt", "w").write("\n".join([("%d" % x) for x in x0[0].reshape(-1) * (2 ** 10)]))
+        # open("inputfp.txt", "w").write("\n".join([("%d" % x) for x in x0[0].reshape(-1) * (2 ** 10)]))
+        # open("input2b.txt", "w").write("\n".join([hex(x % 8)[2:] for x in x0_2b[0].reshape(-1)]))
+        # open("input2b.txt", "w").write("\n".join([("%d" % x) for x in ((x0_2b[0].reshape(-1) + 4) % 8 - 4)]))
+        # open("input2b2d.txt", "w").write(arr2d2s(x0_2b[0] % 8, nbit=3))
+        # f = open("input2b64bbus.txt", "w")
+        # for x in arr2d2s(x0_2b[0] % 8, nbit=3).split("\n"):
+        #     assert len(x) % 16 == 0
+        #     buses = [x[i - 16:i] for i in range(len(arr2d2s(x0_2b[0] % 8, nbit=3).split("\n")[0]), 0, -16)]
+        #     f.write("\n".join(reversed(buses)) + "\n")
+        # f.close()
+        # import pdb; pdb.set_trace()
         # self.qkv.act.alpha.mean() * (2 ** 10)
         qkv = self.qkv(x0_2b)
         # qkv weight output: open("qkv_weightq.mem", "w").write("\n".join([str(p % 8) for p in round_pass((self.qkv.weight / self.qkv.alpha.unsqueeze(1)).clamp(-4, 3)).reshape(3, self.num_heads,1,-1,self.qkv.weight.shape[1])[0,0,0].permute(1,0).reshape(-1).round().int().tolist()]));
@@ -203,8 +265,8 @@ class Q_Attention(nn.Module):
         # qkv weight output: open("qkv_weightkr.mem", "w").write("\n".join([str(p % 8) for p in np.array(round_pass((self.qkv.weight / self.qkv.alpha.unsqueeze(1)).clamp(-4, 3)).reshape(3, self.num_heads,1,-1,self.qkv.weight.shape[1])[1,0,0].permute(1,0).round().int())[:,::-1].reshape(-1).tolist()]));
         # qkv weight output: open("qkv_weightvr.mem", "w").write("\n".join([str(p % 8) for p in np.array(round_pass((self.qkv.weight / self.qkv.alpha.unsqueeze(1)).clamp(-4, 3)).reshape(3, self.num_heads,1,-1,self.qkv.weight.shape[1])[2,0,0].permute(1,0).round().int())[:,::-1].reshape(-1).tolist()]));
         qkv_biased = self.qkv_bias(qkv)
-        # qkv bias output: open("qkv_biasq.mem", "w").write("\n".join(([hex(p % (2 ** 16))[2:] for p in (self.qkv.bias / self.qkv.act.alpha.mean() / self.qkv.alpha).reshape(3, self.num_heads,1,-1)[0,0,0].int().tolist()])))
-        # qkv bias output: open("qkv_biasqr.mem", "w").write("\n".join(([hex(p % (2 ** 16))[2:] for p in np.array((self.qkv.bias / self.qkv.act.alpha.mean() / self.qkv.alpha).reshape(3, self.num_heads,1,-1)[0,0,0].int())[::-1].tolist()])))
+        # qkv bias output: open("qkv_biasq.mem",  "w").write("\n".join(([hex(p % (2 ** 16))[2:] for p in (self.qkv.bias / self.qkv.act.alpha.mean() / self.qkv.alpha).reshape(3, self.num_heads,1,-1)[0,0,0].int().tolist()])))
+        # qkv bias output: open("qkv_biasqr.mem", "w").write("\n".join(([hex(p % (2 ** 16))[2:] for p in ((self.qkv.bias / self.qkv.act.alpha.mean() / self.qkv.alpha).reshape(3, self.num_heads,1,-1)[0,0,0].int())[::-1].tolist()])))
         # qkv bias output: open("qkv_biask.mem", "w").write("\n".join(([hex(p % (2 ** 16))[2:] for p in (self.qkv.bias / self.qkv.act.alpha.mean() / self.qkv.alpha).reshape(3, self.num_heads,1,-1)[1,0,0].int().tolist()])))
         # qkv bias output: open("qkv_biaskr.mem", "w").write("\n".join(([hex(p % (2 ** 16))[2:] for p in np.array((self.qkv.bias / self.qkv.act.alpha.mean() / self.qkv.alpha).reshape(3, self.num_heads,1,-1)[1,0,0].int())[::-1].tolist()])))
         # qkv bias output: open("qkv_biasvr.mem", "w").write("\n".join(([hex(p % (2 ** 16))[2:] for p in np.array((self.qkv.bias / self.qkv.act.alpha.mean() / self.qkv.alpha).reshape(3, self.num_heads,1,-1)[2,0,0].int())[::-1].tolist()])))
@@ -213,6 +275,13 @@ class Q_Attention(nn.Module):
         # alpha_reshaped = self.qkv.alpha.reshape(3, self.num_heads, 1, C // self.num_heads)
         # alpha_reshaped = 1
         
+        # def array2d2s(arr, prefix=""):
+        #     assert len(arr.shape) == 2
+        #     s = ""
+        #     for arr1d in arr:
+        #         s += " ".join([(prefix + "%d" % int(p)) for p in arr1d.tolist()]) + "\n"
+        #     return s
+
         q0, k0, v0 = qkv_reshaped.unbind(0)   # make torchscript happy (cannot use tensor as tuple)
         q2_2b = self.scaled_norm_qact_q(q0) #, qkv_scale[0])
         # snqq_scale: open("snqq_scale.mem", "w").write("\n".join([hex(p % (2 ** 32))[2:] for p in (self.qkv.alpha.reshape(3, self.num_heads,1,-1) * 1024).round().int()[0,0,0].tolist()]))
@@ -247,7 +316,21 @@ class Q_Attention(nn.Module):
         x1_2b = self.proj_act_scaled(x1_prod)
         x2 = self.proj(x1_2b) * self.proj.alpha * self.proj.act.alpha.mean() + self.proj.bias
         x3 = self.proj_drop(x2)
-        import pdb; pdb.set_trace()
+
+        # for idx_head in range(6):
+        #     q0_scaled_by16 = (q0 * self.qkv.alpha.reshape(3, self.num_heads, 1, -1)[0])[0, idx_head] * 16
+        #     open("groundtruths/outq_gt%d.txt" % idx_head, "w").write(array2d2s(q0_scaled_by16.round().int()))
+        #     q0_prescaled = qkv.reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)[0, 0, idx_head]
+        #     open("groundtruths/outqpre_gt%d.txt" % idx_head, "w").write(array2d2s(q0_prescaled))
+        #     k0_scaled_by16 = (k0 * self.qkv.alpha.reshape(3, self.num_heads, 1, -1)[1])[0, idx_head] * 16
+        #     open("groundtruths/outk_gt%d.txt" % idx_head, "w").write(array2d2s(k0_scaled_by16.round().int()))
+        #     k0_prescaled = qkv.reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)[1, 0, idx_head]
+        #     open("groundtruths/outkpre_gt%d.txt" % idx_head, "w").write(array2d2s(k0_prescaled))
+        #     open("groundtruths/outv_gt%d.txt" % idx_head, "w").write(array2d2s(v0[0, idx_head]))
+        #     open("groundtruths/outqk_gt%d.txt" % idx_head, "w").write(array2d2s(qk_prod[0, idx_head]))        
+        #     open("groundtruths/out_attn_gt%d.txt" % idx_head, "w").write(array2d2s((attn_2b @ v2_2b)[0, idx_head]))
+        #     open("groundtruths/out_qkvp_gt%d.txt" % idx_head, "w").write(array2d2s(self.proj(x1_2b * torch.Tensor([0,] * idx_head * 64 + [1,] * 64 + [0,] * (5 - idx_head) * 64).int())[0]))        
+        # import pdb; pdb.set_trace()
         return x3
 
 class Q_Block(nn.Module):
